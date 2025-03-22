@@ -11,8 +11,8 @@ But I don't wanna have to write all that hacked together stuff just to save and 
 #### usage
 - Install with ...
 ```bash
- pip install nnx_save
- ```
+pip install git+https://github.com/kelechi-c/nnx_save
+```
 - saving a model
 ```python
 from nnx_save import save_model
