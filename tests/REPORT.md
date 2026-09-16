@@ -259,10 +259,22 @@ ckpt_dir/
   buffer at a time. The manifest's `PartitionSpec` (captured at save time)
   decides the layout, so a plain builder can be loaded into a sharded model.
 
-Verified on the 8 simulated CPU devices in `tests/test_sharded.py`: values equal
-the single-file path, every parameter comes back sharded, a replicated bias stays
-replicated, a bf16 tied-embedding GPT-2 round-trips, and a model with no mesh
-uses the same layout. **Not verified: cross-process coordination.** The barriers,
+`load_sharded` also accepts a **single `.safetensors` file**: when the target
+model carries the shardings, each local device reads only its own index range
+through safetensors' slice API and the global array is assembled with
+`jax.make_array_from_single_device_arrays` (replicated ranges are read once and
+shared across the devices that need them). That keeps the one-file format while
+giving a pod the per-host byte behaviour of orbax v1's `SafetensorsLayout`; a
+single-file *save* refuses a sharding this process cannot address, because
+`np.asarray(global_array)` would write only the local slice while reporting
+success.
+
+Verified on the 8 simulated CPU devices in `tests/test_sharded.py` and
+`tests/test_single_file_pod.py`: values equal the single-file path, every
+parameter comes back sharded, a replicated bias stays replicated, a bf16
+tied-embedding GPT-2 round-trips, a sharded model loads through the single-file
+shard-range reader, damage is still reported under `strict`, and a model with no
+mesh uses the same layout. **Not verified: cross-process coordination.** The barriers,
 sidecars and per-process files are written for a real pod but no TPU pod was
 available; the layout, the slicing and the sharding are exercised, the
 multi-process handshake is not.

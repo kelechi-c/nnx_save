@@ -105,3 +105,21 @@ def test_bf16_sharded_model_single_file(mesh, tmp_path):
     loaded, _ = load_sharded(target, str(path))
     assert dtype_names(loaded) == {"bfloat16"}, dtype_names(loaded)
     assert all_equal(model, loaded), first_mismatches(model, loaded)
+
+
+def test_single_file_save_refuses_a_non_local_sharding():
+    """A pod-global sharding must not be written as if it were whole."""
+    from nnx_save.checkpointer import _assert_fully_addressable
+
+    class GlobalSharding:
+        is_fully_addressable = False
+
+        def __repr__(self):
+            return "global-sharding"
+
+    class FakeParam:
+        sharding = GlobalSharding()
+
+    with pytest.raises(ValueError, match="save_sharded"):
+        _assert_fully_addressable({"w": FakeParam()}, "ckpt.safetensors")
+    _assert_fully_addressable({"w": jnp.zeros(4)}, "ckpt.safetensors")

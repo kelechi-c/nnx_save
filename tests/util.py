@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
@@ -113,3 +114,69 @@ def dtype_names(model) -> set[str]:
 def leaf_array(model, path: str):
     """One leaf as a numpy array, addressed by its '/'-joined path."""
     return np.asarray(flatten(pure_dict(model))[path])
+
+
+def nested(flat_paths: dict[str, np.ndarray]) -> dict:
+    """``{'a/b/c': array}`` -> ``{'a': {'b': {'c': array}}}``."""
+    out: dict = {}
+    for path, value in flat_paths.items():
+        parts = path.split("/")
+        cur = out
+        for part in parts[:-1]:
+            cur = cur.setdefault(part, {})
+        cur[parts[-1]] = value
+    return out
+
+
+def transpose_linear_kernels(path: str, tensor: np.ndarray) -> np.ndarray:
+    """PyTorch ``(out, in)`` -> NNX ``(in, out)`` for 2-D linear weights.
+
+    This is the standard port trap: ``nn.Linear`` stores the weight
+    transposed relative to ``nnx.Linear``'s kernel, and a square projection
+    (q_proj, o_proj, a pooler) has the same shape either way, so only the
+    logits can catch it.
+    """
+    if path.endswith("/kernel") and tensor.ndim == 2:
+        return tensor.T
+    return tensor
+
+
+def port_into(model, checkpoint: dict[str, np.ndarray], mapper, *, transform=None):
+    """The actual PyTorch -> NNX port: put checkpoint tensors onto the state.
+
+    ``mapper(hf_key)`` returns the NNX path for a checkpoint key (or ``None``
+    for keys this model does not have).  ``transform(path, tensor)`` adapts the
+    tensor layout and defaults to :func:`transpose_linear_kernels`.
+
+    Returns ``(mapped, dropped)``, where ``dropped`` lists ``(key, target)``
+    pairs whose target path has no home in the model -- that is a port bug, so
+    the tests assert it is empty rather than warning.
+    """
+    if transform is None:
+        transform = transpose_linear_kernels
+    expected = set(flatten(pure_dict(model)))
+    mapped, dropped = {}, []
+    for key, value in checkpoint.items():
+        target = mapper(key)
+        if target is None:
+            continue
+        if target not in expected:
+            dropped.append((key, target))
+            continue
+        mapped[target] = transform(target, np.asarray(value))
+    state = nnx.state(model)
+    nnx.replace_by_pure_dict(state, nested(mapped))
+    nnx.update(model, state)
+    return mapped, dropped
+
+
+def cast_params(model, dtype):
+    """Cast every floating parameter of ``model`` to ``dtype``, in place."""
+    nnx.update(
+        model,
+        jax.tree.map(
+            lambda x: x.astype(dtype) if jnp.issubdtype(x.dtype, jnp.floating) else x,
+            nnx.state(model),
+        ),
+    )
+    return model

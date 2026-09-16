@@ -26,6 +26,7 @@ import time
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,6 +40,34 @@ from nnx_save.checkpointer import (  # noqa: E402
 )
 
 from bench_scale import ParamFarm  # noqa: E402
+
+
+class ShapeFarm(nnx.Module):
+    """One parameter per tensor of a real checkpoint's header.
+
+    Used with `--shapes-from` so the memory numbers follow the real tensor-size
+    distribution (many small tensors, a few large ones) instead of a uniform
+    stack of square matrices.
+    """
+
+    def __init__(self, shapes, dtype):
+        self.params = nnx.List([nnx.Param(jnp.zeros(tuple(s), dtype)) for s in shapes])
+
+
+def load_shapes(path, dtype, build=True):
+    """(model or None, parameter count) for a real checkpoint's header shapes.
+
+    Counting must not build the model: on a 2.27 GB checkpoint that would
+    allocate the whole thing just to add up sizes, and the freed memory shows up
+    in the process high-water mark.
+    """
+    import json
+
+    with open(path) as f:
+        raw = json.load(f)
+    shapes = [shape for _dtype, shape in raw.values()]
+    total = sum(int(np.prod(s)) for s in shapes)
+    return (ShapeFarm(shapes, dtype) if build else None), total
 
 # Only the public API is exercised, so these are the numbers a caller sees.
 VARIANTS = ("classic_random", "stream_random", "stream_meta")
@@ -56,13 +85,17 @@ def rss_mb() -> float:
     return 0.0
 
 
-def build_model(n_layers, dim, dtype, *, rngs_seed=1, meta=False):
-    if meta:
-        return nnx.eval_shape(lambda: ParamFarm(n_layers, dim, dtype, rngs=nnx.Rngs(rngs_seed)))
-    return ParamFarm(n_layers, dim, dtype, rngs=nnx.Rngs(rngs_seed))
+def build_model(n_layers, dim, dtype, *, rngs_seed=1, meta=False, shapes_from=None):
+    def build():
+        if shapes_from:
+            return load_shapes(shapes_from, dtype)[0]
+        return ParamFarm(n_layers, dim, dtype, rngs=nnx.Rngs(rngs_seed))
+
+    return nnx.eval_shape(build) if meta else build()
 
 
-def run_variant(name: str, path: str, n_layers: int, dim: int, dtype, json_out: str | None):
+def run_variant(name: str, path: str, n_layers: int, dim: int, dtype, json_out: str | None,
+                shapes_from: str | None = None):
     """Each variant drives nnx_save's public API only."""
     from nnx_save import load_model
 
@@ -74,7 +107,11 @@ def run_variant(name: str, path: str, n_layers: int, dim: int, dtype, json_out: 
     meta = name.endswith("meta")
     stream = name.startswith("stream")
     mark("start")
-    target = (lambda: build_model(n_layers, dim, dtype)) if meta else build_model(n_layers, dim, dtype)
+    target = (
+        (lambda: build_model(n_layers, dim, dtype, shapes_from=shapes_from))
+        if meta
+        else build_model(n_layers, dim, dtype, shapes_from=shapes_from)
+    )
     mark("model built" + (" (abstract)" if meta else " (random)"))
 
     t0 = time.perf_counter()
@@ -86,13 +123,16 @@ def run_variant(name: str, path: str, n_layers: int, dim: int, dtype, json_out: 
     # tensors read one at a time (a full re-read here would pollute the peak).
     from safetensors import safe_open
 
-    leaves = [x for x in jax.tree.leaves(nnx.state(loaded)) if hasattr(x, "shape")]
+    from util import flatten, pure_dict
+
+    by_name = flatten(pure_dict(loaded))  # keys are already "a/b/c" strings
     with safe_open(path, framework="np", backend="pread") as f:
         keys = list(f.keys())
-        probes = [0, len(keys) // 2, len(keys) - 1]
+        probes = [keys[0], keys[len(keys) // 2], keys[-1]]
         ok = all(
-            bool(jnp.array_equal(leaves[i], jnp.asarray(f.get_tensor(keys[i]))))
-            for i in probes
+            key in by_name
+            and bool(jnp.array_equal(by_name[key], jnp.asarray(f.get_tensor(key))))
+            for key in probes
         )
     mark("loaded + spot-checked")
     result = {
@@ -116,6 +156,8 @@ def main() -> None:
     ap.add_argument("--dim", type=int, default=2048)
     ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     ap.add_argument("--variant", choices=VARIANTS, default=None)
+    ap.add_argument("--shapes-from", default=None,
+                    help="JSON of {name: [dtype, shape]} from a real checkpoint header")
     ap.add_argument("--only", nargs="*", choices=VARIANTS, default=None,
                     help="driver mode: measure only these variants")
     ap.add_argument("--json-out", default=None)
@@ -123,19 +165,30 @@ def main() -> None:
 
     dtype = jnp.float32 if args.dtype == "float32" else jnp.bfloat16
     n_layers = max(1, round(args.params_millions * 1e6 / args.dim**2))
-    model_mb = n_layers * args.dim * args.dim * jnp.dtype(dtype).itemsize / 1e6
-    path = f"/tmp/attrib_{args.dtype}.safetensors"
+    if args.shapes_from:
+        n_params = load_shapes(args.shapes_from, dtype, build=False)[1]
+        model_mb = n_params * jnp.dtype(dtype).itemsize / 1e6
+        path = "/tmp/attrib_shapes.safetensors"
+    else:
+        model_mb = n_layers * args.dim * args.dim * jnp.dtype(dtype).itemsize / 1e6
+        path = f"/tmp/attrib_{args.dtype}.safetensors"
 
     if args.variant:  # child process: measure one variant
         if not os.path.exists(path):
-            save_model(ParamFarm(n_layers, args.dim, dtype, rngs=nnx.Rngs(0)), path)
-        run_variant(args.variant, path, n_layers, args.dim, dtype, args.json_out)
+            save_model(build_model(n_layers, args.dim, dtype, shapes_from=args.shapes_from), path)
+        run_variant(args.variant, path, n_layers, args.dim, dtype, args.json_out,
+                    shapes_from=args.shapes_from)
         return
 
     # driver: save once (streaming writer), then measure each variant alone
-    save_model(ParamFarm(n_layers, args.dim, dtype, rngs=nnx.Rngs(0)), path, stream=True)
+    save_model(build_model(n_layers, args.dim, dtype, shapes_from=args.shapes_from), path, stream=True)
     gc.collect()
-    print(f"model: {n_layers} x ({args.dim}, {args.dim}) {args.dtype} = {model_mb:.0f} MB\n")
+    label = (
+        f"{len(json.load(open(args.shapes_from)))} tensors from {args.shapes_from}"
+        if args.shapes_from
+        else f"{n_layers} x ({args.dim}, {args.dim})"
+    )
+    print(f"model: {label} {args.dtype} = {model_mb:.0f} MB\n")
     print(f"{'variant':<16} {'peak RSS':>10} {'x model':>8} {'load s':>8}  values")
     print("-" * 54)
     for variant in (args.only or VARIANTS):
@@ -143,7 +196,8 @@ def main() -> None:
         subprocess.run(
             [sys.executable, __file__, "--params-millions", str(args.params_millions),
              "--dim", str(args.dim), "--dtype", args.dtype, "--variant", variant,
-             "--json-out", out],
+             "--json-out", out]
+            + (["--shapes-from", args.shapes_from] if args.shapes_from else []),
             check=True, capture_output=True,
         )
         with open(out) as f:

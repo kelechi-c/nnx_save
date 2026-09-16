@@ -252,3 +252,439 @@ def shard_state(model, mesh: Mesh, spec=P("x")):
     sharded = jax.tree.map(lambda x: jax.device_put(x, sharding), state)
     nnx.update(model, sharded)
     return model
+
+
+# --------------------------------------------------------------------------
+# Llama-style decoder: the other transformer most inference ports ship.
+#
+# Geometry and math follow HF's ``LlamaForCausalLM``: RMSNorm with no mean
+# subtraction and no bias, RoPE on q/k, grouped-query attention (more query
+# heads than KV heads), a SwiGLU MLP, no biases anywhere, and a separate
+# (untied) ``lm_head``.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class LlamaConfig:
+    """HF ``LlamaConfig`` field names, so a real config.json maps straight on."""
+
+    vocab_size: int = 128
+    hidden_size: int = 32
+    num_hidden_layers: int = 2
+    num_attention_heads: int = 4
+    num_key_value_heads: int = 2  # < heads on purpose: GQA is the hard part
+    intermediate_size: int = 64
+    max_position_embeddings: int = 32
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 10000.0
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_attention_heads
+
+    @property
+    def num_key_value_groups(self) -> int:
+        return self.num_attention_heads // self.num_key_value_heads
+
+
+class LlamaRMSNorm(nnx.Module):
+    """HF ``LlamaRMSNorm``: weight only, no mean subtraction, no bias.
+
+    HF computes the statistics in fp32 and multiplies by the weight in the
+    activation dtype; doing the same keeps a bf16 port close to a bf16
+    transformers model.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6, *, rngs: nnx.Rngs):
+        self.scale = nnx.Param(jnp.ones((dim,), jnp.float32))
+        self.eps = eps
+
+    def __call__(self, x):
+        dtype = x.dtype
+        h = jnp.asarray(x, jnp.float32)
+        variance = jnp.mean(jnp.square(h), axis=-1, keepdims=True)
+        h = h * jax.lax.rsqrt(variance + self.eps)
+        return self.scale.value * h.astype(dtype)
+
+
+def llama_rope(head_dim: int, positions, theta: float):
+    """HF Llama RoPE angles, ``(cos, sin)`` of shape ``(len(positions), head_dim)``.
+
+    Exactly HF's convention (``modeling_rope_utils._compute_default_rope_parameters``):
+
+        inv_freq = 1 / theta ** (arange(0, head_dim, 2) / head_dim)
+        emb      = outer(position, inv_freq), then duplicated: cat(emb, emb)
+
+    The duplication (rather than interleaving) is what makes ``rotate_half``
+    below the matching rotation, so both sides must use this one and not the
+    GPT-J interleaved variant.
+    """
+    inv_freq = 1.0 / (theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
+    freqs = jnp.outer(jnp.asarray(positions, jnp.float32), inv_freq)
+    emb = jnp.concatenate([freqs, freqs], axis=-1)
+    return jnp.cos(emb), jnp.sin(emb)
+
+
+def rotate_half(x):
+    """HF ``rotate_half``: ``cat(-x2, x1)``, i.e. rotate halves, not pairs."""
+    half = x.shape[-1] // 2
+    return jnp.concatenate([-x[..., half:], x[..., :half]], axis=-1)
+
+
+class LlamaAttention(nnx.Module):
+    """GQA attention with RoPE on q/k and no bias on any projection."""
+
+    def __init__(self, cfg: LlamaConfig, *, rngs: nnx.Rngs):
+        self.cfg = cfg
+        q_dim = cfg.num_attention_heads * cfg.head_dim
+        kv_dim = cfg.num_key_value_heads * cfg.head_dim
+        self.q_proj = nnx.Linear(cfg.hidden_size, q_dim, use_bias=False, rngs=rngs)
+        self.k_proj = nnx.Linear(cfg.hidden_size, kv_dim, use_bias=False, rngs=rngs)
+        self.v_proj = nnx.Linear(cfg.hidden_size, kv_dim, use_bias=False, rngs=rngs)
+        self.o_proj = nnx.Linear(q_dim, cfg.hidden_size, use_bias=False, rngs=rngs)
+
+    def __call__(self, x, cos, sin, causal):
+        cfg = self.cfg
+        b, t, _ = x.shape
+
+        def heads(y, n):
+            return y.reshape(b, t, n, cfg.head_dim).transpose(0, 2, 1, 3)
+
+        q = heads(self.q_proj(x), cfg.num_attention_heads)
+        k = heads(self.k_proj(x), cfg.num_key_value_heads)
+        v = heads(self.v_proj(x), cfg.num_key_value_heads)
+
+        # HF casts the angles to the activation dtype before applying them.
+        cos, sin = cos.astype(q.dtype)[None, None], sin.astype(q.dtype)[None, None]
+        q = q * cos + rotate_half(q) * sin
+        k = k * cos + rotate_half(k) * sin
+
+        # GQA: HF's repeat_kv expands (b, n_kv, t, d) to (b, n_kv * n_rep, t, d),
+        # i.e. heads [kv0, kv0, kv1, kv1]. jnp.repeat(axis=1) is exactly that, so
+        # the simplest exact-match approach is an explicit repeat: no need for
+        # jax.nn.dot_product_attention(enable_gqa=True), and the softmax/mask
+        # arithmetic stays identical to HF's eager path.
+        n_rep = cfg.num_key_value_groups
+        if n_rep > 1:
+            k = jnp.repeat(k, n_rep, axis=1)
+            v = jnp.repeat(v, n_rep, axis=1)
+
+        scores = q @ k.swapaxes(-1, -2) / jnp.sqrt(jnp.asarray(cfg.head_dim, q.dtype))
+        scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
+        # HF upcasts the softmax to fp32 and casts the probabilities back.
+        attn = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(q.dtype)
+        ctx = (attn @ v).transpose(0, 2, 1, 3).reshape(b, t, -1)
+        return self.o_proj(ctx)
+
+
+class LlamaMLP(nnx.Module):
+    """SwiGLU: ``down_proj(silu(gate_proj(x)) * up_proj(x))``."""
+
+    def __init__(self, cfg: LlamaConfig, *, rngs: nnx.Rngs):
+        self.gate_proj = nnx.Linear(cfg.hidden_size, cfg.intermediate_size, use_bias=False, rngs=rngs)
+        self.up_proj = nnx.Linear(cfg.hidden_size, cfg.intermediate_size, use_bias=False, rngs=rngs)
+        self.down_proj = nnx.Linear(cfg.intermediate_size, cfg.hidden_size, use_bias=False, rngs=rngs)
+
+    def __call__(self, x):
+        return self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class LlamaBlock(nnx.Module):
+    """Pre-norm block: attention then SwiGLU MLP, both residual."""
+
+    def __init__(self, cfg: LlamaConfig, *, rngs: nnx.Rngs):
+        self.input_layernorm = LlamaRMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
+        self.self_attn = LlamaAttention(cfg, rngs=rngs)
+        self.post_attention_layernorm = LlamaRMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
+        self.mlp = LlamaMLP(cfg, rngs=rngs)
+
+    def __call__(self, x, cos, sin, causal):
+        h = x + self.self_attn(self.input_layernorm(x), cos, sin, causal)
+        return h + self.mlp(self.post_attention_layernorm(h))
+
+
+class TinyLlama(nnx.Module):
+    """HF ``LlamaForCausalLM`` in NNX with real HF parameter paths.
+
+    ``lm_head`` is a separate Linear: Llama checkpoints are untied
+    (``tie_word_embeddings: false``), unlike the GPT-2 fixture.
+    """
+
+    def __init__(self, cfg: LlamaConfig, *, rngs: nnx.Rngs):
+        self.cfg = cfg
+        self.embed_tokens = nnx.Embed(cfg.vocab_size, cfg.hidden_size, rngs=rngs)
+        self.layers = nnx.List([LlamaBlock(cfg, rngs=rngs) for _ in range(cfg.num_hidden_layers)])
+        self.norm = LlamaRMSNorm(cfg.hidden_size, cfg.rms_norm_eps, rngs=rngs)
+        self.lm_head = nnx.Linear(cfg.hidden_size, cfg.vocab_size, use_bias=False, rngs=rngs)
+
+    def __call__(self, ids):
+        _, t = ids.shape
+        # One set of angles for every layer, as HF computes them once up front.
+        cos, sin = llama_rope(self.cfg.head_dim, jnp.arange(t), self.cfg.rope_theta)
+        causal = jnp.tril(jnp.ones((t, t), dtype=bool))
+        x = self.embed_tokens(ids)
+        for block in self.layers:
+            x = block(x, cos, sin, causal)
+        return self.lm_head(self.norm(x))
+
+
+def llama_jax_path_for(hf_key: str) -> str | None:
+    """Map a real HF Llama checkpoint key onto the NNX model's path.
+
+    The names are those of any ``LlamaForCausalLM`` checkpoint; they were
+    checked against ``hf-internal-testing/tiny-random-LlamaForCausalLM``
+    (21 tensors, no biases, untied ``lm_head``). Older checkpoints may also
+    carry a non-persistent ``...self_attn.rotary_emb.inv_freq`` buffer, which
+    has no NNX home and maps to ``None``.
+    """
+    if hf_key == "model.embed_tokens.weight":
+        return "embed_tokens/embedding"
+    if hf_key == "model.norm.weight":
+        return "norm/scale"
+    if hf_key == "lm_head.weight":
+        return "lm_head/kernel"
+    if hf_key.startswith("model.layers."):
+        _, _, idx, rest = hf_key.split(".", 3)
+        table = {
+            "input_layernorm.weight": "input_layernorm/scale",
+            "post_attention_layernorm.weight": "post_attention_layernorm/scale",
+            "self_attn.q_proj.weight": "self_attn/q_proj/kernel",
+            "self_attn.k_proj.weight": "self_attn/k_proj/kernel",
+            "self_attn.v_proj.weight": "self_attn/v_proj/kernel",
+            "self_attn.o_proj.weight": "self_attn/o_proj/kernel",
+            "mlp.gate_proj.weight": "mlp/gate_proj/kernel",
+            "mlp.up_proj.weight": "mlp/up_proj/kernel",
+            "mlp.down_proj.weight": "mlp/down_proj/kernel",
+        }
+        if rest not in table:
+            return None
+        return f"layers/{idx}/" + table[rest]
+    return None
+
+
+# --------------------------------------------------------------------------
+# ViT-style encoder: patch-embedding convolution, class token, pre-LN
+# attention blocks, MLP, final norm and a classification head.  Parameter
+# names follow ``transformers.ViTForImageClassification``.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ViTConfig:
+    """HF ``ViTConfig`` field names (a tiny local geometry)."""
+
+    image_size: int = 8
+    patch_size: int = 4
+    num_channels: int = 3
+    hidden_size: int = 32
+    num_hidden_layers: int = 2
+    num_attention_heads: int = 4
+    intermediate_size: int = 64
+    num_labels: int = 5
+    layer_norm_eps: float = 1e-6
+    hidden_act: str = "gelu"
+
+    @property
+    def num_patches(self) -> int:
+        return (self.image_size // self.patch_size) ** 2
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_attention_heads
+
+
+class ViTPatchEmbeddings(nnx.Module):
+    """The patch conv: NHWC pixels in, ``(batch, num_patches, hidden)`` out."""
+
+    def __init__(self, cfg: ViTConfig, *, rngs: nnx.Rngs):
+        self.projection = nnx.Conv(
+            cfg.num_channels,
+            cfg.hidden_size,
+            kernel_size=(cfg.patch_size, cfg.patch_size),
+            strides=(cfg.patch_size, cfg.patch_size),
+            padding="VALID",
+            rngs=rngs,
+        )
+
+    def __call__(self, pixels):
+        # (b, grid, grid, hidden) -> (b, grid * grid, hidden); jax's spatial
+        # order is row-major, like HF's flatten(2).transpose(1, 2).
+        x = self.projection(pixels)
+        return x.reshape(x.shape[0], -1, x.shape[-1])
+
+
+class ViTEmbeddings(nnx.Module):
+    """Patch embeddings + [CLS] token + learned position embeddings."""
+
+    def __init__(self, cfg: ViTConfig, *, rngs: nnx.Rngs):
+        self.patch_embeddings = ViTPatchEmbeddings(cfg, rngs=rngs)
+        self.cls_token = nnx.Param(
+            0.02 * jax.random.normal(rngs.params(), (1, 1, cfg.hidden_size))
+        )
+        self.position_embeddings = nnx.Param(
+            0.02 * jax.random.normal(rngs.params(), (1, cfg.num_patches + 1, cfg.hidden_size))
+        )
+
+    def __call__(self, pixels):
+        x = self.patch_embeddings(pixels)
+        cls = jnp.broadcast_to(self.cls_token.value, (x.shape[0], 1, x.shape[-1]))
+        return jnp.concatenate([cls, x], axis=1) + self.position_embeddings.value
+
+
+class ViTSelfAttention(nnx.Module):
+    """Unmasked multi-head attention; ViT normalizes in the activation dtype."""
+
+    def __init__(self, cfg: ViTConfig, *, rngs: nnx.Rngs):
+        self.cfg = cfg
+        self.query = nnx.Linear(cfg.hidden_size, cfg.hidden_size, rngs=rngs)
+        self.key = nnx.Linear(cfg.hidden_size, cfg.hidden_size, rngs=rngs)
+        self.value = nnx.Linear(cfg.hidden_size, cfg.hidden_size, rngs=rngs)
+
+    def __call__(self, x):
+        cfg = self.cfg
+        b, t, _ = x.shape
+
+        def heads(y):
+            return y.reshape(b, t, cfg.num_attention_heads, cfg.head_dim).transpose(0, 2, 1, 3)
+
+        q, k, v = heads(self.query(x)), heads(self.key(x)), heads(self.value(x))
+        scores = q @ k.swapaxes(-1, -2) / jnp.sqrt(jnp.asarray(cfg.head_dim, q.dtype))
+        attn = jax.nn.softmax(scores, axis=-1)
+        return (attn @ v).transpose(0, 2, 1, 3).reshape(b, t, -1)
+
+
+class ViTSelfOutput(nnx.Module):
+    def __init__(self, cfg: ViTConfig, *, rngs: nnx.Rngs):
+        self.dense = nnx.Linear(cfg.hidden_size, cfg.hidden_size, rngs=rngs)
+
+    def __call__(self, x):
+        return self.dense(x)
+
+
+class ViTAttention(nnx.Module):
+    def __init__(self, cfg: ViTConfig, *, rngs: nnx.Rngs):
+        self.attention = ViTSelfAttention(cfg, rngs=rngs)
+        self.output = ViTSelfOutput(cfg, rngs=rngs)
+
+    def __call__(self, x):
+        return self.output(self.attention(x))
+
+
+class ViTIntermediate(nnx.Module):
+    def __init__(self, cfg: ViTConfig, *, rngs: nnx.Rngs):
+        self.dense = nnx.Linear(cfg.hidden_size, cfg.intermediate_size, rngs=rngs)
+
+    def __call__(self, x):
+        return self.dense(x)
+
+
+class ViTOutput(nnx.Module):
+    def __init__(self, cfg: ViTConfig, *, rngs: nnx.Rngs):
+        self.dense = nnx.Linear(cfg.intermediate_size, cfg.hidden_size, rngs=rngs)
+
+    def __call__(self, x):
+        return self.dense(x)
+
+
+class ViTLayer(nnx.Module):
+    """Pre-LN block: ``attention(ln_before(x)) + x``, then ``mlp(ln_after) + x``."""
+
+    def __init__(self, cfg: ViTConfig, *, rngs: nnx.Rngs):
+        self.layernorm_before = nnx.LayerNorm(cfg.hidden_size, epsilon=cfg.layer_norm_eps, rngs=rngs)
+        self.attention = ViTAttention(cfg, rngs=rngs)
+        self.layernorm_after = nnx.LayerNorm(cfg.hidden_size, epsilon=cfg.layer_norm_eps, rngs=rngs)
+        self.intermediate = ViTIntermediate(cfg, rngs=rngs)
+        self.output = ViTOutput(cfg, rngs=rngs)
+
+    def __call__(self, x):
+        h = x + self.attention(self.layernorm_before(x))
+        mlp = self.output(jax.nn.gelu(self.intermediate(self.layernorm_after(h)), approximate=False))
+        return h + mlp
+
+
+class ViTEncoder(nnx.Module):
+    """HF's ``vit.encoder``: a ``layer.N`` block list."""
+
+    def __init__(self, cfg: ViTConfig, *, rngs: nnx.Rngs):
+        self.layer = nnx.List([ViTLayer(cfg, rngs=rngs) for _ in range(cfg.num_hidden_layers)])
+
+    def __call__(self, x):
+        for layer in self.layer:
+            x = layer(x)
+        return x
+
+
+class ViTModel(nnx.Module):
+    """The ``vit`` sub-tree: embeddings, encoder blocks, final layer norm."""
+
+    def __init__(self, cfg: ViTConfig, *, rngs: nnx.Rngs):
+        self.embeddings = ViTEmbeddings(cfg, rngs=rngs)
+        self.encoder = ViTEncoder(cfg, rngs=rngs)
+        self.layernorm = nnx.LayerNorm(cfg.hidden_size, epsilon=cfg.layer_norm_eps, rngs=rngs)
+
+    def __call__(self, pixels):
+        return self.layernorm(self.encoder(self.embeddings(pixels)))
+
+
+class TinyViT(nnx.Module):
+    """``ViTForImageClassification`` in NNX: ``vit.*`` encoder + ``classifier``.
+
+    HF classifies the final-norm [CLS] token and does not build the pooler, so
+    the checkpoint has no ``vit.pooler.*`` keys.
+    """
+
+    def __init__(self, cfg: ViTConfig, *, rngs: nnx.Rngs):
+        self.cfg = cfg
+        self.vit = ViTModel(cfg, rngs=rngs)
+        self.classifier = nnx.Linear(cfg.hidden_size, cfg.num_labels, rngs=rngs)
+
+    def __call__(self, pixels):
+        return self.classifier(self.vit(pixels)[:, 0])
+
+
+def vit_jax_path_for(hf_key: str) -> str | None:
+    """Map a real HF ViT checkpoint key onto the NNX model's path.
+
+    Names follow ``transformers.ViTForImageClassification`` and were checked
+    against ``hf-internal-testing/tiny-random-vit``: ``vit.encoder.layer.N.*``
+    for the blocks, ``vit.layernorm`` after them, and a ``classifier`` head
+    (no pooler).
+    """
+    simple = {
+        "vit.embeddings.cls_token": "vit/embeddings/cls_token",
+        "vit.embeddings.position_embeddings": "vit/embeddings/position_embeddings",
+        # nnx.Conv's kernel is (kh, kw, in, out); the HF conv weight is
+        # (out, in, kh, kw) and is permuted by the port, not here.
+        "vit.embeddings.patch_embeddings.projection.weight": "vit/embeddings/patch_embeddings/projection/kernel",
+        "vit.embeddings.patch_embeddings.projection.bias": "vit/embeddings/patch_embeddings/projection/bias",
+        "vit.layernorm.weight": "vit/layernorm/scale",
+        "vit.layernorm.bias": "vit/layernorm/bias",
+        "classifier.weight": "classifier/kernel",
+        "classifier.bias": "classifier/bias",
+    }
+    if hf_key in simple:
+        return simple[hf_key]
+    if hf_key.startswith("vit.encoder.layer."):
+        _, _, _, idx, rest = hf_key.split(".", 4)
+        table = {
+            "layernorm_before.weight": "layernorm_before/scale",
+            "layernorm_before.bias": "layernorm_before/bias",
+            "layernorm_after.weight": "layernorm_after/scale",
+            "layernorm_after.bias": "layernorm_after/bias",
+            "attention.attention.query.weight": "attention/attention/query/kernel",
+            "attention.attention.query.bias": "attention/attention/query/bias",
+            "attention.attention.key.weight": "attention/attention/key/kernel",
+            "attention.attention.key.bias": "attention/attention/key/bias",
+            "attention.attention.value.weight": "attention/attention/value/kernel",
+            "attention.attention.value.bias": "attention/attention/value/bias",
+            "attention.output.dense.weight": "attention/output/dense/kernel",
+            "attention.output.dense.bias": "attention/output/dense/bias",
+            "intermediate.dense.weight": "intermediate/dense/kernel",
+            "intermediate.dense.bias": "intermediate/dense/bias",
+            "output.dense.weight": "output/dense/kernel",
+            "output.dense.bias": "output/dense/bias",
+        }
+        if rest not in table:
+            return None
+        return f"vit/encoder/layer/{idx}/" + table[rest]
+    return None
