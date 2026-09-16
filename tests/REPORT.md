@@ -15,7 +15,7 @@
 | safetensors | 0.8.0 |
 | numpy | 2.5.3 |
 | torch (porting reference) | 2.14.0+cpu |
-| Hardware | 8 cores, 31 GB RAM, no GPU (the CUDA half ran on `victoria`, an RTX 3050 6 GB, over Tailscale) |
+| Hardware | 8 cores, 31 GB RAM, no GPU; `victoria` (RTX 3050 6 GB, over Tailscale) ran the PyTorch reference on its GPU plus the whole JAX suite on CPU |
 
 The library was written in March 2025; this is roughly a year of drift in jax, flax and
 safetensors, which is where the failures come from.
@@ -119,6 +119,11 @@ Coverage that matters for the original use case:
 | loaded model under `nnx.jit` | matches the pre-save forward pass |
 | damaged checkpoints (missing / wrong shape / wrong dtype / extra keys) | warn or raise, never silent |
 
+The same suite (minus the five torch-dependent port tests) and both scripts were then re-run
+**on victoria**, against its own CPU jax: `29 passed`, the real-checkpoint port check passed
+again, and the scale benchmark reproduced the numbers below. GPU-side JAX was not exercised
+there — see §6.
+
 ### Real checkpoint, real port
 
 `hf-internal-testing/tiny-random-gpt2` was downloaded on victoria and its logits computed
@@ -149,10 +154,15 @@ torch reference built locally, in fp32, bf16 and fp16.
 
 `tests/bench_scale.py`, 125.8M parameters on CPU (503 MB fp32 / 252 MB bf16):
 
-| dtype | file | save | load | peak RSS, save | peak RSS, load |
+| machine | dtype | file | save | load | peak RSS, load |
 | --- | --- | --- | --- | --- | --- |
-| fp32 | 503 MB | 0.63 s | 1.18 s | 1.05x model | **3.91x model** (2.16 GB) |
-| bf16 | 252 MB | 0.19 s | 0.62 s | 1.14x model | **4.00x model** (1.20 GB) |
+| 8-core CPU box | fp32 | 503 MB | 0.63 s | 1.18 s | **3.91x model** (2.16 GB) |
+| 8-core CPU box | bf16 | 252 MB | 0.19 s | 0.62 s | **4.00x model** (1.20 GB) |
+| victoria | fp32 | 503 MB | 0.25 s | 0.29 s | **4.04x model** (2.22 GB) |
+| victoria | bf16 | 252 MB | 0.16 s | 0.17 s | **4.00x model** (1.19 GB) |
+
+Both machines ran JAX on CPU: `np.asarray` on a CPU jax array is zero-copy, so the save
+column there is a lower bound — on an accelerator it includes a full device→host copy.
 
 Saving is cheap on CPU because `np.asarray` on a CPU jax array is zero-copy; on an
 accelerator it is a genuine device→host transfer, so the save figure there includes one
@@ -178,7 +188,14 @@ bf16 model (F7 makes that automatic) halves it again.
 4. **Strings and `/` in names** are unsupported and now fail loudly.
 5. **No atomic write.** A crash mid-`save_file` leaves a partial checkpoint; write to a
    temporary path and `os.replace` if that matters.
-6. On flax 0.12 the `variable.value` accessor used in test models is itself deprecated in
+6. **GPU-side JAX is untested.** On victoria, `jax-cuda13-plugin` installed cleanly but
+   never registered a backend (`Backend 'cuda' is not in the list of known backends:
+   ['cpu', 'tpu']`), and installing the full `jax[cuda13]` extra would have pulled ~3.5 GB of
+   `nvidia-*` wheels over a measured ~1 MB/s link. The GPU was therefore used for the torch
+   reference logits, not for a jax run. The save/load code paths it would have exercised
+   (`np.asarray` on a device array, `jax.device_put` with a sharding) are backend-agnostic,
+   but that is an argument, not a measurement.
+7. On flax 0.12 the `variable.value` accessor used in test models is itself deprecated in
    favour of `variable[...]`/`get_value()`; that is NNX drift, not an nnx_save issue.
 
 ## 7. Reproducing
