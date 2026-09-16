@@ -21,3 +21,5 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 def pytest_configure(config):
     config.addinivalue_line("markers", "hazard: asserts the safe behaviour for a known silent-failure mode")
     config.addinivalue_line("markers", "tpu_style: multi-device / bf16 / sharding tests")
+    config.addinivalue_line("markers", "streaming: streaming save/load tests")
+    config.addinivalue_line("markers", "sharded: pod-style per-process shard layout tests")

@@ -14,7 +14,10 @@ inference — survive a save/load round-trip unchanged?**
 | `test_ported_gpt2.py` | Full PyTorch→NNX port: an HF-named GPT-2 checkpoint is ported into NNX, checked against torch logits, then round-tripped through `nnx_save` in fp32/bf16/fp16 |
 | `port_hf_reference.py` | *(needs torch+transformers)* Downloads a real HF checkpoint and dumps torch reference logits |
 | `port_hf_check.py` | *(needs jax only)* Ports that real checkpoint into NNX, checks the logits match, then round-trips it through `nnx_save` in fp32 and bf16 |
+| `test_streaming.py` | The streaming writer/reader: file validity for the official loader, equivalence with the classic path, the abstract-builder entry point, header alignment |
+| `test_sharded.py` | Pod-style layout: per-process shard files, manifest consistency, sharded/replicated mixes, bf16 + tied embeddings, the non-local-sharding guard |
 | `bench_scale.py` | Save/load wall time and peak host RAM for a ~125M-parameter model |
+| `bench_memory_attribution.py` | Peak RSS per load strategy in isolated processes (classic vs streaming vs abstract builder) |
 | `models.py`, `torch_ref.py`, `util.py` | Fixtures: NNX models, the torch reference implementation, comparison helpers |
 
 `conftest.py` sets `XLA_FLAGS=--xla_force_host_platform_device_count=8`, so the

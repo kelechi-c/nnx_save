@@ -35,10 +35,37 @@ updated_model, new_state = load_model(model, 'model.safetensors')
 
 nnx.display(model) # optional visualization
 ```
-#### implementation details
-- **saving**: get the model state, convert to pure dictionary, flatten, save as a .safetensor file (with the official `safetensors` library of course).
 
-- **loading**: retrieve the model state mapping/pytree from file, unfold to original state, get/replace initialized model state, return updated model.
+- loading without ever building a random model (much less host RAM)
+```python
+# pass a builder instead of a model: it is built with nnx.eval_shape, so the
+# parameters exist as shapes only until the checkpoint fills them in
+updated_model, new_state = load_model(
+    lambda: nnx.Linear(768, 64, rngs=nnx.Rngs(0)), 'model.safetensors'
+)
+```
+
+- many devices / TPU pod (one shard file per process, nothing gathers the model)
+```python
+from nnx_save import save_sharded, load_sharded
+
+save_sharded(model, 'ckpt_dir')          # every process writes its own shards
+updated_model, state = load_sharded(model, 'ckpt_dir')
+```
+#### implementation details
+- **saving**: get the model state, convert to pure dictionary, flatten, save as a .safetensor file (with the official `safetensors` library of course). Tensor by tensor by default, so only one host copy is alive at a time.
+- **loading**: retrieve the model state mapping/pytree from file, unfold to original state, get/replace initialized model state, return updated model. One tensor is read and placed at a time, with the host buffer released before the next.
+
+#### memory
+Peak host RAM for a load, measured in a fresh process on a 567.6M-parameter fp32 model (2.27 GB — the size of the full Stable Audio 3 *small* checkpoint):
+
+| load path | peak host RAM | load time |
+| --- | --- | --- |
+| whole file into memory (`stream=False`) | **3.21x** the model (7.3 GB) | 13.3 s |
+| streaming, random-initialised model | 2.08x (4.7 GB) | 2.3 s |
+| streaming + builder (`nnx.eval_shape`) | **1.24x** (2.8 GB) | 1.7 s |
+
+Three things buy that: `safe_open(...).get_tensor()` reads one tensor instead of the whole file (`safetensors.numpy.load_file` materialises every tensor at once), the builder means no randomly initialised copy of the model is ever allocated, and casting happens on the host before the transfer (one device temporary instead of two). Loading into a bf16 model halves the weights again. On an accelerator the result lives in device memory, so the host figure is smaller still; on a pod `save_sharded`/`load_sharded` keep only this process's shards on this host.
 
 #### things worth knowing
 - **state only**: the graph definition is not stored, so `load_model` needs a model built with the same structure as the one that was saved. If the structure does not line up, the load says so instead of quietly keeping random weights.
@@ -47,9 +74,10 @@ nnx.display(model) # optional visualization
   - wrong shape → skipped with a warning (never installed);
   - dtype mismatch → values are cast to the dtype the model declares, so a bf16 model stays bf16;
   - extra keys in the file → warning (useful when checking a ported checkpoint's mapping).
-- **sharding and placement**: loaded values go back on the accelerator with the sharding of the variable they replace, so a model built sharded and bf16 (the TPU inference case) stays that way.
-- **rng state**: `nnx.Rngs` keys and counts are saved and restored too (typed PRNG keys are stored as their `uint32` key data).
+- **sharding and placement**: loaded values go back on the accelerator with the sharding of the variable they replace, so a model built sharded and bf16 (the TPU inference case) stays that way. That path is for shardings this process can address; for a multi-host sharding use `load_sharded`, which reads only the local bytes instead of asking every host for the whole tensor.
+- **scalar variables and rngs**: python scalar variables come back as the type they went in as (when loading into a model, not a builder — an abstract build cannot tell an `int` from a 0-dim array), and `nnx.Rngs` keys/counts are saved as their `uint32` key data and rebuilt as typed keys.
 - **not supported**: string values in the state (safetensors has no string dtype) and `/` in attribute names (it collides with the checkpoint key separator). Both fail at save time with a message naming the offending parameter.
+- **cost on save**: tensor-at-a-time, so the device→host staging is one tensor rather than the whole model; the file is a normal `.safetensors` that any other tool can read.
 
 #### verified against
-`jax 0.11.1`, `flax 0.12.9`, `safetensors 0.8.0` — 34 tests covering plain/nested/`nnx.List`/conv models, dtypes from f32 to bf16 and i8, rngs, batchnorm statistics, tied embeddings, 8-device sharding, and a PyTorch→NNX GPT-2 port checked against torch logits. See [`tests/README.md`](tests/README.md) and [`tests/REPORT.md`](tests/REPORT.md).
+`jax 0.11.1`, `flax 0.12.9`, `safetensors 0.8.0` — 34 tests covering plain/nested/`nnx.List`/conv models, dtypes from f32 to bf16 and i8, rngs, batchnorm statistics, tied embeddings, 8-device sharding, a PyTorch→NNX GPT-2 port checked against torch logits, streaming/classic equivalence, and the pod-style shard layout. See [`tests/README.md`](tests/README.md) and [`tests/REPORT.md`](tests/REPORT.md).

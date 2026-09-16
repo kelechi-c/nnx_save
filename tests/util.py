@@ -95,8 +95,19 @@ def all_equal(model_a, model_b) -> bool:
 
 
 def dtype_names(model) -> set[str]:
-    """Dtype names of every leaf, normalized ('bfloat16', not a class)."""
-    return {np.dtype(v.dtype).name for v in flatten(pure_dict(model)).values()}
+    """Dtype names of every leaf, normalized ('bfloat16', not a class).
+
+    PRNG keys report the dtype of the uint32 data they are stored as.
+    """
+    out = set()
+    for value in flatten(pure_dict(model)).values():
+        if isinstance(value, jax.Array) and jax.dtypes.issubdtype(value.dtype, jax.dtypes.prng_key):
+            out.add(np.dtype(jax.random.key_data(value).dtype).name)
+        elif hasattr(value, "dtype"):
+            out.add(np.dtype(value.dtype).name)
+        else:
+            out.add(np.asarray(value).dtype.name)
+    return out
 
 
 def leaf_array(model, path: str):

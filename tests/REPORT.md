@@ -2,7 +2,7 @@
 
 - Date: 2026-09-16
 - Library under test: `/home/tensor/Shared/code/ml/nnx_save` @ `a23d9f3` (plus the fixes below)
-- Test suite: [`tests/`](.) — 34 tests, plus two scripts for a real checkpoint port
+- Test suite: [`tests/`](.) — round-trip, failure-mode, sharding, streaming, pod-layout and PyTorch-port tests, plus scripts for a real checkpoint port and the memory benchmark
 - Verdict in one line: **the published code could not save a single model on the current stack; after four blocking fixes the save/load round-trip is exact — including a real PyTorch→JAX port at bf16 — and the loader now reports anything it cannot apply instead of silently keeping random weights.**
 
 ## 1. Environment
@@ -174,7 +174,128 @@ jax copy, and the freshly built model that is being replaced). For the 1.4B-para
 host-RAM kill that `medium` hit on victoria. Saving in bf16 halves it, and loading into a
 bf16 model (F7 makes that automatic) halves it again.
 
-## 6. Remaining limitations
+## 6. Memory: where the ~4x came from, and the streaming redesign
+
+### 6.1 Attribution
+
+`tests/bench_memory_attribution.py` measures each strategy in its own process
+(`ru_maxrss` is a process high-water mark) and traces `VmRSS` per phase. On a
+125.8M-parameter fp32 model (503 MB):
+
+| strategy | peak RSS | x model | load |
+| --- | ---: | ---: | ---: |
+| `load_file` -> nest -> `jnp.asarray` -> replace -> merge, random model (the original path) | 1680 MB | 3.34x | 1.00 s |
+| same, model built with `nnx.eval_shape` | 1148 MB | 2.28x | 1.13 s |
+| per-tensor `safe_open` (`mmap`), random model | 1838 MB | 3.65x | 0.53 s |
+| per-tensor `safe_open` (`pread`), random model | 1359 MB | 2.70x | 0.42 s |
+| per-tensor `pread` + `nnx.eval_shape` (the new default) | 794 MB | 1.58x | 0.51 s |
+
+The phase trace shows the three terms: the randomly initialised model (+533 MB),
+`safetensors.numpy.load_file` materialising the whole file into anonymous host
+RAM (+480 MB for a 503 MB file — the numpy binding copies even with
+`backend="mmap"`, unlike the torch binding), and the jax host copies (+452 MB).
+Dropping the random model removes one, reading one tensor at a time removes the
+second, and casting on the host before `jax.device_put` keeps the transfer to a
+single temporary.
+
+Above the interpreter baseline (~190 MB), the new default needs **~1.2x** the
+model in host RAM where the original needed **~3.0x**.
+
+### 6.2 At Stable Audio 3 *small* scale
+
+567.6M parameters fp32 = **2.27 GB** — the real `model.safetensors` of
+`stabilityai/stable-audio-3-small-music` (measured from its header on victoria:
+684 tensors, all F32; the separate T5Gemma text encoder is another 1.18 GB).
+Synthetic parameters of exactly that volume, so no model download is involved:
+
+| load path | 8-core CPU box | victoria (RTX 3050 host, 7.5 GB RAM) |
+| --- | ---: | ---: |
+| `stream=False`, random model (original) | **7.27 GB peak, 13.3 s** | not runnable (exceeds the box) |
+| `stream=True`, random model | 4.71 GB, 2.3 s | 4.29 GB, 2.2 s |
+| `stream=True` + builder (new default) | **2.82 GB, 1.7 s** | **2.46 GB, 2.0 s** |
+
+In other words: with the original code, loading the full SA3-small checkpoint
+(plus the 1.18 GB text encoder) does not fit on the 7.5 GB host that has been
+running SA3 inference; with the streaming path it uses about 2.5 GB and loads
+~6x faster because the file is no longer read and copied twice. bf16 halves the
+weights again. The same arithmetic on the 9.22 GB `medium` checkpoint (metadata
+only, not downloaded) puts the original path near 30 GB of host RAM and the
+streaming path near 11 GB.
+
+### 6.3 The API
+
+* `save_model(model, path, stream=True)` — writes the header, then one tensor at
+  a time (`save()`/`numpy.save` would add a full `bytes()` copy, and
+  `serialize_file` requires every source buffer alive at once).
+* `load_model(model_or_builder, path, strict=False, stream=True)` — `stream=False`
+  keeps the old whole-dictionary path for comparison; a zero-argument builder is
+  built with `nnx.eval_shape`, so no random parameters are allocated.
+* `load_model` refuses a sharding this process cannot address, with a message
+  pointing at `load_sharded` — because `jax.device_put(full_array, global_sharding)`
+  on a pod requires *every* host to hold the whole array.
+
+## 7. TPU-resident checkpoints: `save_sharded` / `load_sharded`
+
+A single file cannot be loaded by a pod without one host gathering everything,
+so the library now also writes the layout pod checkpointers use — one shard file
+per process plus a manifest:
+
+```
+ckpt_dir/
+  manifest.json      # per tensor: dtype, global shape, PartitionSpec, per-process offset/shape
+  shard_00000.bin    # process 0's local shards, concatenated
+  shard_00000.json   # process 0's sidecar (merged into the manifest)
+  shard_00001.bin
+```
+
+* **save**: each process takes *its own* slice of every global array with
+  `jax.experimental.multihost_utils.global_array_to_host_local_array` — never
+  `np.asarray(global_array)`, which gathers every host's shards — writes those
+  bytes and a sidecar, then process 0 merges the sidecars into the manifest after
+  a `sync_global_devices` barrier. Replicated parameters are written once per
+  process, sharded ones only as the local slice.
+* **load**: each process reads only its own file and assembles global arrays with
+  `host_local_array_to_global_array`, per tensor, so the host holds one shard
+  buffer at a time. The manifest's `PartitionSpec` (captured at save time)
+  decides the layout, so a plain builder can be loaded into a sharded model.
+
+Verified on the 8 simulated CPU devices in `tests/test_sharded.py`: values equal
+the single-file path, every parameter comes back sharded, a replicated bias stays
+replicated, a bf16 tied-embedding GPT-2 round-trips, and a model with no mesh
+uses the same layout. **Not verified: cross-process coordination.** The barriers,
+sidecars and per-process files are written for a real pod but no TPU pod was
+available; the layout, the slicing and the sharding are exercised, the
+multi-process handshake is not.
+
+### 7.1 How the established libraries solve the same problem
+
+(Read from the installed sources — `orbax-checkpoint 0.12.4`, `jax 0.11.1`,
+`safetensors 0.8.0` — records in
+[`../agent-hub/wiki/nnx-checkpointing-pitfalls.md`](/home/tensor/Shared/code/agent-hub/wiki/nnx-checkpointing-pitfalls.md).)
+
+| technique | who uses it | what it saves |
+| --- | --- | --- |
+| one tensor at a time (`safe_open` + `get_tensor`), never `load_file` | orbax, HF, this library now | ~1x (the numpy binding copies the whole file) |
+| abstract/meta model init (`nnx.eval_shape`, `torch.device("meta")`) | orbax v1 (`ShapeDtypeStruct` restore target), transformers (unconditional since v4.51) | ~1x |
+| read only this process's shards, assemble with `make_array_from_single_device_arrays` / `host_local_array_to_global_array` | orbax `ArrayHandler`, this library | scales as 1/n_hosts |
+| bound in-flight bytes (`restore_concurrent_bytes`, v1 `MemoryOptions.read_concurrent_bytes`, default 2 GiB / 128 MiB chunks) | orbax | O(budget) instead of O(model) |
+| cast on the host before H2D ("avoid 2 copies on device") | orbax `_read_shard` | one device temporary |
+| bind the parameter instead of copying into it (`assign=True`, `setattr`) | HF/accelerate/PyTorch | one destination allocation |
+| per-process shard directories (`ocdbt.process_N`) | orbax | standard pod layout |
+| single-file ranged reads driven by the target sharding | orbax v1 `SafetensorsLayout` | per-host bytes, no cross-process traffic |
+
+Two findings from that pass changed this library's defaults: the numpy
+`load_file` binding is *eager* (so per-tensor reads are the whole win, not an
+optimisation), and `jax.device_put(full_array, global_sharding)` on a pod demands
+the full array on every host (hence the guard in §6.3).
+
+Known gaps against that table: no in-flight byte budget (a 100 GB checkpoint
+would stream fine but without a cap), no single-file ranged reader for pods
+(orbax v1 `SafetensorsLayout` is the reference implementation: map each local
+shard's index domain to byte runs and `pread` exactly those), and no async
+overlap of the device-to-host copy with the file write.
+
+## 8. Remaining limitations
 
 1. **State only.** The graph definition is not stored, so the caller must rebuild the same
    structure first. Since the fixes, a structural mistake shows up as missing/extra-key
@@ -182,9 +303,11 @@ bf16 model (F7 makes that automatic) halves it again.
 2. **Sharding is adopted, not stored.** Loading into a model that was built sharded keeps
    that sharding; loading into an unsharded model gives replicated parameters. Shard the
    model (or `jax.device_put` the state) before or after the load, deliberately.
-3. **Multi-host / TPU-pod saving is untested.** `np.asarray` gathers the *addressable*
-   devices only; on a multi-controller pod each process would write its own copy. A
-   per-shard writer is the correct fix and is not implemented.
+3. **Multi-host / TPU-pod saving is untested.** `save_sharded`/`load_sharded` now
+   implement the per-process layout and refuse to gather other hosts' shards, and
+   `load_model` rejects a non-local sharding — but the cross-process handshake has
+   never run on a pod. A single-file pod reader (byte ranges per shard, as in orbax
+   v1's `SafetensorsLayout`) is not implemented.
 4. **Strings and `/` in names** are unsupported and now fail loudly.
 5. **No atomic write.** A crash mid-`save_file` leaves a partial checkpoint; write to a
    temporary path and `os.replace` if that matters.
