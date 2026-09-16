@@ -147,8 +147,17 @@ ported 64 tensors, 0 unknown keys: []
 ALL CHECKS PASSED
 ```
 
-The same port is exercised as a normal test (`tests/test_ported_gpt2.py`) against a
-torch reference built locally, in fp32, bf16 and fp16.
+Three architecture families are exercised as normal tests against HF-faithful
+torch references built locally — GPT-2 (`tests/test_ported_gpt2.py`), a
+Llama-style decoder with RMSNorm/RoPE/GQA/SwiGLU and no biases
+(`test_ported_llama.py`, `max|jax-torch| = 1.19e-07`) and a ViT-style encoder
+with a patch-embedding conv (`test_ported_vit.py`, `3.35e-08`) — each in fp32
+and bf16, each with a per-tensor coverage test that fails on a missing or
+transposed tensor, and each also loadable through a builder. The torch
+references were cross-checked by loading the real `hf-internal-testing` tiny
+checkpoints with `strict=True`; the limitation is that `transformers` itself is
+not installed here, so "matches torch" means the re-implemented HF math, not a
+live `transformers` forward pass.
 
 ## 5. Cost at scale
 
@@ -204,15 +213,21 @@ model in host RAM where the original needed **~3.0x**.
 ### 6.2 At Stable Audio 3 *small* scale
 
 567.6M parameters fp32 = **2.27 GB** — the real `model.safetensors` of
-`stabilityai/stable-audio-3-small-music` (measured from its header on victoria:
-684 tensors, all F32; the separate T5Gemma text encoder is another 1.18 GB).
-Synthetic parameters of exactly that volume, so no model download is involved:
+`stabilityai/stable-audio-3-small-music`, read from its header on victoria: 685
+tensors, all F32, largest 8.39M parameters, median 1024 (the separate T5Gemma
+text encoder is another 1.18 GB). The benchmark takes that header's exact shape
+list, so the numbers follow the real tensor-size distribution without
+downloading the weights (`--shapes-from`):
 
-| load path | 8-core CPU box | victoria (RTX 3050 host, 7.5 GB RAM) |
+| load path | 8-core CPU box | victoria (7.5 GB RAM) |
 | --- | ---: | ---: |
-| `stream=False`, random model (original) | **7.27 GB peak, 13.3 s** | not runnable (exceeds the box) |
-| `stream=True`, random model | 4.71 GB, 2.3 s | 4.29 GB, 2.2 s |
-| `stream=True` + builder (new default) | **2.82 GB, 1.7 s** | **2.46 GB, 2.0 s** |
+| `stream=False`, random model (original) | **6.87 GB peak, 5.7 s** | not runnable (exceeds the box) |
+| `stream=True`, random model | 4.74 GB, 4.3 s | — |
+| `stream=True` + builder (new default) | **2.56 GB, 4.0 s** | **2.49 GB, 1.9 s** |
+
+(The same measurements on a uniform 135 x 2048² model of identical volume were
+3.21x / 2.08x / 1.24x: 685 small tensors cost more per-tensor overhead and
+slightly less peak, since no single tensor is large.)
 
 In other words: with the original code, loading the full SA3-small checkpoint
 (plus the 1.18 GB text encoder) does not fit on the 7.5 GB host that has been

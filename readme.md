@@ -57,13 +57,14 @@ updated_model, state = load_sharded(model, 'ckpt_dir')
 - **loading**: retrieve the model state mapping/pytree from file, unfold to original state, get/replace initialized model state, return updated model. One tensor is read and placed at a time, with the host buffer released before the next.
 
 #### memory
-Peak host RAM for a load, measured in a fresh process on a 567.6M-parameter fp32 model (2.27 GB — the size of the full Stable Audio 3 *small* checkpoint):
+Peak host RAM for a load, in a fresh process, on the **real tensor shapes** of
+`stabilityai/stable-audio-3-small-music`: 685 tensors, 567.6M parameters, 2.27 GB fp32.
 
-| load path | peak host RAM | load time |
+| load path | 8-core CPU box | RTX 3050 host (7.5 GB RAM) |
 | --- | --- | --- |
-| whole file into memory (`stream=False`) | **3.21x** the model (7.3 GB) | 13.3 s |
-| streaming, random-initialised model | 2.08x (4.7 GB) | 2.3 s |
-| streaming + builder (`nnx.eval_shape`) | **1.24x** (2.8 GB) | 1.7 s |
+| whole file into memory (`stream=False`) | **3.03x** the model (6.9 GB), 5.7 s | does not fit |
+| streaming, random-initialised model | 2.09x (4.7 GB), 4.3 s | — |
+| streaming + builder (`nnx.eval_shape`) | **1.13x** (2.6 GB), 4.0 s | **1.10x** (2.5 GB), 1.9 s |
 
 Three things buy that: `safe_open(...).get_tensor()` reads one tensor instead of the whole file (`safetensors.numpy.load_file` materialises every tensor at once), the builder means no randomly initialised copy of the model is ever allocated, and casting happens on the host before the transfer (one device temporary instead of two). Loading into a bf16 model halves the weights again. On an accelerator the result lives in device memory, so the host figure is smaller still; on a pod `save_sharded`/`load_sharded` keep only this process's shards on this host.
 
@@ -80,4 +81,4 @@ Three things buy that: `safe_open(...).get_tensor()` reads one tensor instead of
 - **cost on save**: tensor-at-a-time, so the device→host staging is one tensor rather than the whole model; the file is a normal `.safetensors` that any other tool can read.
 
 #### verified against
-`jax 0.11.1`, `flax 0.12.9`, `safetensors 0.8.0` — 34 tests covering plain/nested/`nnx.List`/conv models, dtypes from f32 to bf16 and i8, rngs, batchnorm statistics, tied embeddings, 8-device sharding, a PyTorch→NNX GPT-2 port checked against torch logits, streaming/classic equivalence, and the pod-style shard layout. See [`tests/README.md`](tests/README.md) and [`tests/REPORT.md`](tests/REPORT.md).
+`jax 0.11.1`, `flax 0.12.9`, `safetensors 0.8.0` — 73 tests covering plain/nested/`nnx.List`/conv models, dtypes from f32 to bf16 and i8, rngs, batchnorm statistics, tied embeddings, 8-device sharding, streaming/classic equivalence, the pod-style shard layout, the single-file shard-range reader, and three PyTorch→NNX ports checked against torch logits (GPT-2, a Llama-style decoder with RMSNorm/RoPE/GQA/SwiGLU, and a ViT-style encoder). See [`tests/README.md`](tests/README.md) and [`tests/REPORT.md`](tests/REPORT.md).
