@@ -50,6 +50,7 @@ from .checkpointer import (
 
 FORMAT = "nnx_save.sharded.v1"
 MANIFEST = "manifest.json"
+_SINGLE_FILE_SUFFIXES = (".safetensors",)
 
 
 def _shard_base(directory: str, process_index: int) -> str:
@@ -198,13 +199,92 @@ def _place(array, existing, path, report):
     return array
 
 
-def load_sharded(model, directory, mesh=None, strict=False, barrier=True):
-    """Read a directory written by `save_sharded` into `model`.
+def _load_single_file_shards(model, path, strict):
+    """Load a single .safetensors file, reading only this process's shards.
 
-    `model` may be a module or a zero-argument builder (see `load_model`). Only
-    this process's shard file is read; global arrays are assembled from the
-    local buffers with `host_local_array_to_global_array`.
+    This is the "one file, many hosts" case: the target model carries the
+    shardings (build it with `nnx.with_partitioning`, or shard it explicitly),
+    and for every tensor each local device reads just its own index range with
+    safetensors' slice API, then the global array is assembled with
+    `jax.make_array_from_single_device_arrays`. No host reads another host's
+    bytes and nothing is gathered. Same idea as orbax v1's `SafetensorsLayout`.
     """
+    from safetensors import safe_open
+
+    if not isinstance(model, nnx.Module) and callable(model):
+        model = nnx.eval_shape(model)
+
+    graphdef, abstract_state = nnx.split(model)
+    flat_expected = {
+        "/".join(str(p) for p in key): (key, value)
+        for key, value in flatten_dict(_to_pure_dict(abstract_state)).items()
+    }
+    report = {"missing": [], "wrong_shape": [], "cast": [], "extra": []}
+    matched = {}
+    seen = set()
+    local_devices = {str(d): d for d in jax.local_devices()}
+
+    with safe_open(path, framework="np", backend="pread") as f:
+        file_keys = set(f.keys())
+        for file_key, (key, existing) in flat_expected.items():
+            if file_key not in file_keys:
+                report["missing"].append(key)
+                continue
+            seen.add(file_key)
+            sharding = getattr(existing, "sharding", None)
+            shape = getattr(existing, "shape", None)
+            spec = getattr(sharding, "spec", None)
+            if sharding is None or spec is None or shape is None:
+                # No target sharding: this tensor is read whole.
+                value = f.get_tensor(file_key)
+                converted = _leaf_from_host(value, existing, key, report)
+                del value
+                if converted is not None:
+                    matched[key] = converted
+                continue
+
+            slices = f.get_slice(file_key)
+            pieces: dict[tuple, object] = {}
+            shards = []
+            for device, index in sharding.devices_indices_map(tuple(shape)).items():
+                if str(device) not in local_devices:
+                    continue
+                token = repr(index)
+                if token not in pieces:
+                    pieces[token] = jax.device_put(slices[index], device)
+                shards.append(pieces[token])
+            if not shards:
+                report["missing"].append(key)
+                continue
+            assembled = jax.make_array_from_single_device_arrays(
+                tuple(shape), sharding, shards
+            )
+            converted = _place(assembled, existing, key, report)
+            del assembled, shards, pieces
+            if converted is not None:
+                matched[key] = converted
+
+        for file_key in file_keys - seen:
+            report["extra"].append(tuple(file_key.split("/")))
+
+    _emit_report(report, path, strict)
+    nnx.replace_by_pure_dict(abstract_state, unflatten_dict(matched))
+    model = nnx.merge(graphdef, abstract_state)
+    return model, nnx.state(model)
+
+
+def load_sharded(model, directory, mesh=None, strict=False, barrier=True):
+    """Read a checkpoint written by `save_sharded`, or a single file.
+
+    `directory` may be the directory layout written by `save_sharded`, or a
+    single `.safetensors` file whose tensors are sharded according to the target
+    model (each process then reads only its own shard bytes). `mesh` is used for
+    the directory layout's global assembly; the single-file path takes its
+    shardings from the model itself.
+    """
+    if os.path.isfile(directory):
+        return _load_single_file_shards(model, directory, strict)
+
     if not isinstance(model, nnx.Module) and callable(model):
         model = nnx.eval_shape(model)
 
