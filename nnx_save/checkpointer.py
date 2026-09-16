@@ -215,6 +215,23 @@ def _flatten_for_save(state, sep="/"):
     return flatten(_to_pure_dict(state))
 
 
+def _assert_fully_addressable(flat_dict, model_file):
+    """A single-file save writes whole tensors, so it needs all the shards.
+
+    On a pod, `np.asarray(global_array)` would write only this process's slice
+    while reporting success; `save_sharded` is the correct path there.
+    """
+    for key, value in flat_dict.items():
+        sharding = getattr(value, "sharding", None)
+        if sharding is None or getattr(sharding, "is_fully_addressable", True):
+            continue
+        raise ValueError(
+            f"nnx_save: {_leaf_name(key)} is sharded across devices this process cannot "
+            f"address ({sharding}). A single file is written from one host; use "
+            "nnx_save.save_sharded for a multi-host model."
+        )
+
+
 def save_model(model, model_file='./model.safetensors', stream=True):
     """Write the model's state to `model_file`.
 
@@ -223,6 +240,7 @@ def save_model(model, model_file='./model.safetensors', stream=True):
     `stream=False` keeps the original whole-dictionary behaviour.
     """
     flat_dict = _flatten_for_save(nnx.state(model))
+    _assert_fully_addressable(flat_dict, model_file)
 
     if stream:
         _save_streaming(model_file, flat_dict)
